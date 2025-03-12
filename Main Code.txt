@@ -1,0 +1,260 @@
+
+import cv2
+import numpy as np
+import pytesseract
+from urllib.request import urlopen
+import re
+import requests
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import db
+from datetime import datetime
+# Initialize Firebase Admin SDK
+cred = credentials.Certificate("E:\\FreeLance Projects\\pythonProject\\numberplatedetection-53466-firebase-adminsdk-mb1us-ec1adfddbb.json")  # Replace with your service account JSON file
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://numberplatedetection-53466-default-rtdb.firebaseio.com/'  # Replace with your database URL
+})
+
+# URL of the ESP32-CAM stream
+esp32_stream_url = 'http://<ESP32_CAM_IP>/stream'  # Replace <ESP32_CAM_IP> with the actual IP address
+
+
+# Function to get current time and date in desired format
+def get_current_time_date():
+    # Get current time and date
+    now = datetime.now()
+
+    # Format time as "Hours:Minutes:Seconds"
+    current_time = now.strftime("%H:%M:%S")
+
+    # Format date as "Day-Month-Year"
+    current_date = now.strftime("%d-%m-%Y")
+
+    return current_time, current_date
+
+
+
+
+def write_to_firebase(number,owner,color,type,model, time):
+    ref = db.reference('Registered Vehicals/' + number + '/Owner Name')
+    ref.set(owner)
+    ref = db.reference('Registered Vehicals/' + number + '/Vehicle Type')
+    ref.set(type)
+    ref = db.reference('Registered Vehicals/' + number + '/Vehicle Model')
+    ref.set(model)
+    ref = db.reference('Registered Vehicals/' + number + '/Vehicle Color')
+    ref.set(color)
+    ref = db.reference('Registered Vehicals/' + number + '/Registration Time')
+    ref.set(time)
+def Read_from_firebase(text):
+    ref = db.reference('Registered Vehicals/' + text)
+    data = ref.get()
+    return data
+
+
+# Function to detect number plate and extract text
+def detect_number_plate(frame):
+    # Convert to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Use a bilateral filter to reduce noise
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+
+    # Use Canny Edge Detection
+    edged = cv2.Canny(gray, 170, 200)
+
+    # Find contours in the edged frame
+    contours, _ = cv2.findContours(edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+    # Initialize the number plate contour
+    number_plate_contour = None
+
+    # Loop over contours to find the number plate
+    for contour in contours:
+        # Approximate the contour
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.018 * peri, True)
+
+        # If the contour has 4 sides, it's likely to be the number plate
+        if len(approx) == 4:
+            number_plate_contour = approx
+            break
+
+    if number_plate_contour is not None:
+        # Draw the contour on the original frame
+        cv2.drawContours(frame, [number_plate_contour], -1, (0, 255, 0), 3)
+
+        # Mask everything except the number plate
+        mask = np.zeros(gray.shape, np.uint8)
+        new_image = cv2.drawContours(mask, [number_plate_contour], 0, 255, -1)
+        new_image = cv2.bitwise_and(frame, frame, mask=mask)
+
+        # Crop the image to the number plate
+        (x, y) = np.where(mask == 255)
+        (topx, topy) = (np.min(x), np.min(y))
+        (bottomx, bottomy) = (np.max(x), np.max(y))
+        cropped = gray[topx:bottomx + 1, topy:bottomy + 1]
+
+        # Use pytesseract to extract text
+        text = pytesseract.image_to_string(cropped, config='--psm 11')
+        return text.strip()
+    else:
+        return None
+
+
+# Function to validate and format number plate text
+def is_valid_number_plate(text):
+    # Regex to allow any characters before two or three alphabets followed by digits
+    pattern = r'.*?([A-Z]{2,3})[^A-Z0-9]*([0-9]+)$'
+
+    # Check if the text matches the pattern
+    match = re.search(pattern, text)
+    if match:
+        # Extract the alphabets and numbers
+        alphabets = match.group(1)
+        numbers = match.group(2)
+
+        # Format the text as "LE 500"
+        formatted_text = f"{alphabets} {numbers}"
+        return formatted_text
+    return None
+
+
+# Main function to process video stream from webcam
+def process_webcam_video(register_flag):
+    # Open the webcam
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
+
+    while True:
+        # Capture frame-by-frame
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Detect the number plate
+        number_plate_text = detect_number_plate(frame)
+        if number_plate_text:
+            valid_text = is_valid_number_plate(number_plate_text)
+            if valid_text:
+                if register_flag == 1:
+                    owner_name = input("Detected Number Plate, Enter Name of the owner")
+                    car_type = input("Enter Type")
+                    car_model = input("Enter Model")
+                    color = input("Enter Color")
+                    time, date = get_current_time_date()
+                    formatted_time_date = f"Time: {time}, Date: {date}"
+                    write_to_firebase(valid_text, owner_name,color,car_type,car_model, formatted_time_date)
+                else:
+                    data = Read_from_firebase(valid_text)
+                    time, date = get_current_time_date()
+                    formatted_time_date = f"Time: {time}, Date: {date}"
+                    if data != None:
+                        print(data)
+                        print(formatted_time_date)
+                        ref = db.reference('Detection Monitor/' + valid_text)
+                        ref.set(data)
+                        ref = db.reference('Detection Monitor/' + valid_text +'/Time and Date')
+                        ref.set(formatted_time_date)
+                    else:
+                        print("Unregistered Vehicle")
+                        ref = db.reference('Detection Monitor/'+ valid_text+'/Registration')
+                        ref.set('Unregistered vehicle')
+                        ref = db.reference('Detection Monitor/'+ valid_text +'/Time and Date')
+                        ref.set(formatted_time_date)
+                        print(formatted_time_date)
+        # Display the frame
+        cv2.imshow('Webcam Video Stream', frame)
+
+        # Break the loop if 'ESC' is pressed
+        if cv2.waitKey(1) == 27:
+            break
+
+    # Release the webcam and close windows
+    cap.release()
+    register_flag=0
+    cv2.destroyAllWindows()
+
+
+##################################################
+# def process_webcam_video():
+#     stream = requests.get(esp32_stream_url, stream=True)
+#     bytes_data = b''
+#
+#     while True:
+#         bytes_data += stream.raw.read(1024)
+#         start = bytes_data.find(b'\xff\xd8')
+#         end = bytes_data.find(b'\xff\xd9')
+#
+#         if start != -1 and end != -1:
+#             jpg_data = bytes_data[start:end + 2]
+#             bytes_data = bytes_data[end + 2:]
+#             img = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+#
+#             if img is not None:
+#         number_plate_text = detect_number_plate(img)
+#         if number_plate_text:
+#             valid_text = is_valid_number_plate(number_plate_text)
+#             if valid_text:
+#                 if valid_text:
+#                 if register_flag == 1:
+#                     owner_name = input("Detected Number Plate, Enter Name of the owner")
+#                     car_type = input("Enter Type")
+#                     car_model = input("Enter Model")
+#                     color = input("Enter Color")
+#                     time, date = get_current_time_date()
+#                     formatted_time_date = f"Time: {time}, Date: {date}"
+#                     write_to_firebase(valid_text, owner_name,color,car_type,car_model, formatted_time_date)
+#                 else:
+#                     data = Read_from_firebase(valid_text)
+#                     time, date = get_current_time_date()
+#                     formatted_time_date = f"Time: {time}, Date: {date}"
+#                                         if data != None:
+#                         print(data)
+#                         print(formatted_time_date)
+#                         ref = db.reference('Detection Monitor/' + valid_text)
+#                         ref.set(data)
+#                         ref = db.reference('Detection Monitor/' + valid_text +'/Time and Date')
+#                         ref.set(formatted_time_date)
+#                     else:
+#                         print("Unregistered Vehicle")
+#                         ref = db.reference('Detection Monitor/'+ valid_text+'/Registration')
+#                         ref.set('Unregistered vehicle')
+#                         ref = db.reference('Detection Monitor/'+ valid_text +'/Time and Date')
+#                         ref.set(formatted_time_date)
+#                         print(formatted_time_date)
+#
+#                 cv2.imshow('ESP32-CAM Stream', img)
+#
+#                 if cv2.waitKey(1) == 27:
+#                     break
+#
+#     cv2.destroyAllWindows()
+
+def menu():
+    print("---------------------------------")
+    print("Welcome to motor detection system")
+    print("---------------------------------")
+    print("1) Register motor")
+    print("2) Motor Detection")
+    print("3) Exit")
+
+    opt = input("Select your option")
+
+    if opt == '1':
+        register_flag = 1
+        process_webcam_video(register_flag)
+    elif opt == '2':
+        register_flag = 0
+        process_webcam_video(register_flag)
+    elif opt == '3':
+        register_flag = 0
+
+
+
+# Run the webcam video processing
+menu()
